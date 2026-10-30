@@ -1,150 +1,213 @@
+
 import socket
 import time
 import csv
 from pathlib import Path
 
-IP, PORT = "192.168.250.1", 64000
+IP = "192.168.250.1"
+PORT = 64000
 DURATION = 0.1
-SCALE_MM = 0.00001  
+MM_PER_COUNT = 0.00001
 
-def read_exact(sock, n):
+def exact(sock, n):
     data = bytearray()
     while len(data) < n:
-        part = sock.recv(n - len(data))
-        if not part:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
             raise ConnectionError("Connection closed")
-        data.extend(part)
+        data.extend(chunk)
     return bytes(data)
 
-def read_until(sock, delimiter=b",", limit=32):
+def ascii_field(sock, limit=32):
     data = bytearray()
-    while not data.endswith(delimiter):
+    while True:
+        b = exact(sock, 1)
+        if b == b",":
+            return data.decode("ascii")
         if len(data) >= limit:
-            raise ValueError("Invalid response header")
-        data.extend(read_exact(sock, 1))
-    return bytes(data[:-len(delimiter)])
+            raise ValueError("Invalid ASCII field")
+        data.extend(b)
 
-def cmd(sock, name):
+def command(sock, name):
     sock.sendall((name + "\r\n").encode("ascii"))
-    result = bytearray()
-    while not result.endswith(b"\r\n"):
-        result.extend(read_exact(sock, 1))
-    reply = result.decode("ascii").strip()
-    print(name, "->", reply)
-    return reply
+    reply = bytearray()
+    while not reply.endswith(b"\r\n"):
+        reply.extend(exact(sock, 1))
+        if len(reply) > 256:
+            raise ValueError("Unexpected command reply")
+    return reply.decode("ascii").strip()
 
-# 1. Record a short buffer
+def read_lb_frame(sock):
+    # Ignore CR/LF between consecutive frames
+    first = exact(sock, 1)
+    while first in (b"\r", b"\n"):
+        first = exact(sock, 1)
+
+    if first != b"L":
+        raise ValueError(f"Invalid frame start: {first!r}")
+
+    if exact(sock, 2) != b"B,":
+        raise ValueError("Invalid LB header")
+
+    size_text = ascii_field(sock)
+    try:
+        size = int(size_text, 16)
+    except ValueError:
+        raise ValueError(f"Invalid size: {size_text!r}")
+
+    if not 3 <= size <= 65536:
+        raise ValueError(f"Unreasonable frame size: {size}")
+
+    frame = exact(sock, size)
+
+    status = int.from_bytes(frame[:2], "little")
+    option = frame[2]
+
+    if option != 1:
+        raise ValueError(f"Unexpected option: {option}")
+
+    final = (status == 0xFFFF)
+
+    # SUM is present only in the final frame
+    if final:
+        if len(frame) < 5:
+            raise ValueError("Final frame too short")
+        payload = frame[3:-2]
+        checksum = frame[-2:]
+    else:
+        payload = frame[3:]
+        checksum = None
+
+    return status, payload, final, checksum
+
+# ------------------------------------------------
+# 1. Short buffering test
+# ------------------------------------------------
+
 with socket.create_connection((IP, PORT), timeout=5) as s:
     s.settimeout(5)
-    print("Initial:", cmd(s, "LI"))
 
-    if cmd(s, "LS") != "LS,OK":
-        raise RuntimeError("Buffer start failed")
+    initial = command(s, "LI")
+    print("Initial:", initial)
+
+    start = command(s, "LS")
+    print("Start:", start)
+
+    if start != "LS,OK":
+        raise RuntimeError("Could not start buffering")
 
     try:
         time.sleep(DURATION)
     finally:
-        print("Stop:", cmd(s, "LE"))
+        stop = command(s, "LE")
+        print("Stop:", stop)
 
-    status = cmd(s, "LI")
+    info = command(s, "LI")
+    print("Status:", info)
 
-parts = status.split(",")
-if len(parts) != 4 or parts[1] != "2":
-    raise RuntimeError("Unexpected buffer status")
+fields = info.split(",")
 
-label = int(parts[2], 16)
-count = int(parts[3], 16)
+if len(fields) != 4 or fields[1] != "2":
+    raise ValueError("Unexpected LI status")
+
+label = int(fields[2], 16)
+count = int(fields[3], 16)
+
 print("Recorded points:", count)
 
 if label < 1 or count < 1:
-    raise RuntimeError("No readable buffered data")
+    raise RuntimeError("No buffered data available")
 
-# 2. Download one label, with timestamps
+# ------------------------------------------------
+# 2. Download buffered data
+# ------------------------------------------------
+
 request = f"LB,1,1,{label:X},1\r\n"
-binary = bytearray()
-frame_count = 0
+buffer = bytearray()
+frames = 0
 
 with socket.create_connection((IP, PORT), timeout=10) as s:
     s.settimeout(10)
     s.sendall(request.encode("ascii"))
 
-    while True:
-        prefix = read_until(s)
-        if prefix != b"LB":
-            raise RuntimeError(f"Unexpected LB reply: {prefix!r}")
+    while frames < 1000:
+        status, payload, final, checksum = read_lb_frame(s)
 
-        size_text = read_until(s)
-        size = int(size_text, 16)
+        buffer.extend(payload)
+        frames += 1
 
-        # Read exactly the binary payload bytes
-        frame = read_exact(s, size)
+        print(
+            f"Frame {frames}: "
+            f"status={status:04X}, "
+            f"payload={len(payload)} bytes"
+        )
 
-        output_status = int.from_bytes(frame[:2], "little")
-        option = frame[2]
-
-        if option != 1:
-            raise RuntimeError("Timestamp option missing")
-
-        last = output_status == 0xFFFF
-
-        # The final frame contains a 2-byte SUM
-        binary.extend(frame[3:-2] if last else frame[3:])
-        frame_count += 1
-
-        if last:
-            # CR+LF follows the final binary frame
-            ending = read_exact(s, 2)
-            if ending != b"\r\n":
-                raise RuntimeError(
-                    f"Invalid final delimiter: {ending!r}"
-                )
+        if final:
             break
+    else:
+        raise RuntimeError("Too many LB frames")
 
-print("Frames downloaded:", frame_count)
-print("Binary payload bytes:", len(binary))
+print("Frames downloaded:", frames)
+print("Total payload bytes:", len(buffer))
 
-# 3. Parse label and samples
-if len(binary) < 4:
-    raise RuntimeError("Missing label header")
+# ------------------------------------------------
+# 3. Parse label data
+# ------------------------------------------------
 
-label_size = int.from_bytes(binary[:4], "little")
-label_data = binary[4:]
+if len(buffer) < 4:
+    raise ValueError("Missing label size")
 
-if label_size != len(label_data):
-    raise RuntimeError(
-        f"Label size mismatch: {label_size} vs {len(label_data)}"
+label_size = int.from_bytes(buffer[:4], "little")
+data = buffer[4:]
+
+print("Declared label size:", label_size)
+print("Actual label size:", len(data))
+
+if label_size != len(data):
+    raise ValueError("Label size mismatch")
+
+# Each sample: 6-byte timestamp + 21 x 4 bytes
+RECORD_SIZE = 90
+
+if len(data) % RECORD_SIZE != 0:
+    raise ValueError(
+        f"Record size mismatch: {len(data)} bytes"
     )
 
-# 6 timestamp bytes + 21 x 4-byte fields = 90 bytes
-RECORD_SIZE = 90
-if len(label_data) % RECORD_SIZE:
-    raise RuntimeError("Unexpected record size")
+errors = {
+    0x7FFFFFFD: "Light Excess",
+    0x7FFFFFFE: "Light Shortage",
+    0x7FFFFFFF: "Undetermined",
+}
 
 rows = []
-for i in range(0, len(label_data), RECORD_SIZE):
-    record = label_data[i:i + RECORD_SIZE]
+
+for offset in range(0, len(data), RECORD_SIZE):
+    record = data[offset:offset + RECORD_SIZE]
 
     timestamp = int.from_bytes(record[:6], "little")
+
+    # CH1 measurement: field after 4-byte header
     raw = int.from_bytes(record[10:14], "little")
 
-    errors = {
-        0x7FFFFFFD: "Light Excess",
-        0x7FFFFFFE: "Light Shortage",
-        0x7FFFFFFF: "Undetermined",
-    }
-
     if raw in errors:
-        value_mm = None
+        distance = None
         state = errors[raw]
     else:
-        signed = raw if raw < 0x80000000 else raw - 0x100000000
-        value_mm = signed * SCALE_MM
+        signed = (
+            raw if raw < 0x80000000
+            else raw - 0x100000000
+        )
+        distance = signed * MM_PER_COUNT
         state = "OK"
 
-    rows.append([timestamp, value_mm, state, f"{raw:08X}"])
+    rows.append((timestamp, distance, state, f"{raw:08X}"))
 
-# 4. Inspect timing, measurements and save CSV
-print("\nFirst 10 samples:")
+# ------------------------------------------------
+# 4. Verify results
+# ------------------------------------------------
+
+print("\nFirst 10 measurements:")
 for row in rows[:10]:
     print(row)
 
@@ -154,7 +217,7 @@ intervals = [
 ]
 
 if intervals:
-    print("\nMean timestamp interval (ms):",
+    print("\nMean interval (ms):",
           sum(intervals) / len(intervals))
     print("Min / Max interval (ms):",
           min(intervals), max(intervals))
@@ -162,11 +225,15 @@ if intervals:
 valid = sum(row[2] == "OK" for row in rows)
 print("Valid measurements:", valid, "/", len(rows))
 
+# Save locally only after successful parsing
 output = Path.cwd() / "zp_buffer_test.csv"
+
 with output.open("w", newline="", encoding="utf-8") as f:
     writer = csv.writer(f)
-    writer.writerow(["timestamp_ms", "distance_mm",
-                     "status", "raw_hex"])
+    writer.writerow([
+        "timestamp_ms", "distance_mm",
+        "status", "raw_hex"
+    ])
     writer.writerows(rows)
 
-print("CSV saved:", output)
+print("Saved:", output)
