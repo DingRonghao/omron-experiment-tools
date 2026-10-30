@@ -75,22 +75,29 @@ with socket.create_connection((IP, PORT), timeout=10) as s:
 
         size_text = read_until(s)
         size = int(size_text, 16)
-        frame = read_exact(s, size)
 
-        if not frame.endswith(b"\r\n"):
-            raise RuntimeError("Invalid frame ending")
+        # Read exactly the binary payload bytes
+        frame = read_exact(s, size)
 
         output_status = int.from_bytes(frame[:2], "little")
         option = frame[2]
+
         if option != 1:
             raise RuntimeError("Timestamp option missing")
 
         last = output_status == 0xFFFF
-        # Remove status, option, checksum (last frame), CRLF
-        binary.extend(frame[3:-4] if last else frame[3:-2])
+
+        # The final frame contains a 2-byte SUM
+        binary.extend(frame[3:-2] if last else frame[3:])
         frame_count += 1
 
         if last:
+            # CR+LF follows the final binary frame
+            ending = read_exact(s, 2)
+            if ending != b"\r\n":
+                raise RuntimeError(
+                    f"Invalid final delimiter: {ending!r}"
+                )
             break
 
 print("Frames downloaded:", frame_count)
